@@ -1,2 +1,4 @@
+config/credentials.json
+config/token.json
 node_modules/
 .env

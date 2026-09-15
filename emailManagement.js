@@ -138,16 +138,15 @@ async function fetchTargetedEmails(criteria) {
   try {
     const connection = await connectToImap(config);
 
-    let searchCriteria = ['ALL'];
+    let searchCriteria = ['UNSEEN'];
     if (criteria.from) searchCriteria.push(['FROM', criteria.from]);
     if (criteria.subject) searchCriteria.push(['SUBJECT', criteria.subject]);
     searchCriteria.push(['SINCE', criteria.since.toISOString()]);
 
-    const fetchOptions = { bodies: ['HEADER', 'TEXT', ''], markSeen: false };
+    const fetchOptions = { bodies: ['HEADER', 'TEXT', ''], markSeen: true };
     const messages = await fetchEmails(connection, searchCriteria, fetchOptions);
     
     const messagesToProcess = criteria.maxEmails ? messages.slice(0, criteria.maxEmails) : messages;
-
     const processedEmails = await Promise.all(messagesToProcess.map(parseEmail));
 
     connection.end();
@@ -157,7 +156,55 @@ async function fetchTargetedEmails(criteria) {
   }
 }
 
-async function displayEmails(emails) {
+async function processSingleEmail(auth, email) {
+  console.log(`\nProcessing email:`);
+  console.log(`From: ${email.from}`);
+  console.log(`Subject: ${email.subject}`);
+
+  const meetingKeywords = ['meeting', 'conference', 'call', 'discussion', 'appointment', 'zoom', 'google meet', 'teams', 'demo', 'boarding'];
+  const hasMeetingKeyword = meetingKeywords.some(keyword => 
+    email.subject.toLowerCase().includes(keyword) || email.text.toLowerCase().includes(keyword)
+  );
+
+  if (hasMeetingKeyword) {
+    console.log('Meeting keyword detected in email');
+    const meetingDetails = parseDateTime(email.text);
+    
+    if (meetingDetails) {
+      console.log('Meeting details extracted:', meetingDetails);
+
+      const eventDetails = {
+        summary: email.subject,
+        description: email.text.substring(0, 500),
+        startDateTime: meetingDetails.startDateTime,
+        endDateTime: meetingDetails.endDateTime,
+      };
+
+      try {
+        console.log('Adding event to calendar...');
+        const eventLink = await addEventToCalendar(auth, eventDetails);
+        console.log('Event added successfully:', eventLink);
+
+        const message = `New meeting added to your calendar:
+Subject: ${eventDetails.summary}
+Time: ${eventDetails.startDateTime.toLocaleString()}
+Event Link: ${eventLink}
+Reminders set for 24 hours and 1 hour before the event.`;
+        await sendWhatsAppMessage(message);
+        return true;
+      } catch (error) {
+        console.error('Failed to add event to calendar:', error);
+      }
+    } else {
+      console.log('Meeting keyword detected, but could not extract date and time.');
+    }
+  } else {
+    console.log('No meeting keywords found in this email');
+  }
+  return false;
+}
+
+async function displayEmails(auth, emails) {
   emails.forEach((email, index) => {
     console.log(`
 Email ${index + 1}:
@@ -171,7 +218,7 @@ Links: ${email.links.length > 0 ? email.links.map(l => `- ${l.text}: ${l.href}`)
 `);
   });
 
-  const emailIndex = await askQuestion("\nEnter the email number to view full details, reply, or type 'exit' to quit: ");
+  const emailIndex = await askQuestion("\nEnter the email number to view full details and process event, or type 'exit' to quit: ");
   
   if (emailIndex.toLowerCase() === 'exit') {
     console.log('Exiting...');
@@ -190,15 +237,13 @@ Subject: ${selectedEmail.subject}
 Date: ${selectedEmail.date}
 Body:
 ${selectedEmail.text}
-
-Attachments:
-${selectedEmail.attachments.length > 0 ? selectedEmail.attachments.map(a => `${a.filename} (${a.contentType}, ${a.size} bytes)`).join('\n') : 'None'}
-
-Links:
-${selectedEmail.links.length > 0 ? selectedEmail.links.map(l => `${l.text}: ${l.href}`).join('\n') : 'None'}
 `);
 
-    const action = await askQuestion("Do you want to reply to this email? (yes/no): ");
+    console.log('-----------------------------------');
+    console.log('Running Calendar & WhatsApp Pipeline...');
+    await processSingleEmail(auth, selectedEmail);
+
+    const action = await askQuestion("\nDo you want to reply to this email? (yes/no): ");
     if (action.toLowerCase() === 'yes') {
       await replyToEmail(selectedEmail);
     }
@@ -247,55 +292,19 @@ async function processEmails(auth) {
     const emails = await fetchTargetedEmails(criteria);
     console.log(`Total emails fetched: ${emails.length}`);
 
+    if (emails.length === 0) {
+      console.log('No emails found matching criteria.');
+      return;
+    }
+
     let meetingsDetected = 0;
     let eventsCreated = 0;
 
     for (const email of emails) {
-      console.log(`\nProcessing email:`);
-      console.log(`From: ${email.from}`);
-      console.log(`Subject: ${email.subject}`);
-
-      const meetingKeywords = ['meeting', 'conference', 'call', 'discussion', 'appointment', 'zoom', 'google meet', 'teams'];
-      const hasMeetingKeyword = meetingKeywords.some(keyword => 
-        email.subject.toLowerCase().includes(keyword) || email.text.toLowerCase().includes(keyword)
-      );
-
-      if (hasMeetingKeyword) {
-        console.log('Meeting keyword detected in email');
+      const isCreated = await processSingleEmail(auth, email);
+      if (isCreated) {
         meetingsDetected++;
-
-        const meetingDetails = parseDateTime(email.text);
-        
-        if (meetingDetails) {
-          console.log('Meeting details extracted:', meetingDetails);
-
-          const eventDetails = {
-            summary: email.subject,
-            description: email.text.substring(0, 500),
-            startDateTime: meetingDetails.startDateTime,
-            endDateTime: meetingDetails.endDateTime,
-          };
-
-          try {
-            console.log('Adding event to calendar...');
-            const eventLink = await addEventToCalendar(auth, eventDetails);
-            console.log('Event added successfully:', eventLink);
-            eventsCreated++;
-
-            const message = `New meeting added to your calendar:
-Subject: ${eventDetails.summary}
-Time: ${eventDetails.startDateTime.toLocaleString()}
-Event Link: ${eventLink}
-Reminders set for 24 hours and 1 hour before the event.`;
-            await sendWhatsAppMessage(message);
-          } catch (error) {
-            console.error('Failed to add event to calendar:', error);
-          }
-        } else {
-          console.log('Meeting detected, but could not extract date and time. Skipping calendar event creation.');
-        }
-      } else {
-        console.log('No meeting keywords found in this email');
+        eventsCreated++;
       }
     }
 
@@ -304,7 +313,7 @@ Reminders set for 24 hours and 1 hour before the event.`;
     console.log(`Meetings detected: ${meetingsDetected}`);
     console.log(`Events created: ${eventsCreated}`);
 
-    await displayEmails(emails);
+    await displayEmails(auth, emails);
   } catch (error) {
     console.error('An error occurred:', error);
   }
@@ -316,8 +325,7 @@ async function main() {
     await processEmails(auth);
   } catch (err) {
     console.error("\nError:", err.message);
-  } finally {
-    rl.close();
+    rl.close(); // Only close here if an unhandled top-level error occurs
   }
 }
 
