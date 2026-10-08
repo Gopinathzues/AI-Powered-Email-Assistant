@@ -33,6 +33,7 @@ AI-Powered-Email-Assistant/
 ├── emailManagement.js       # Main application pipeline
 └── README.md
 
+
 🚀 Getting Started
 1. Installation
 
